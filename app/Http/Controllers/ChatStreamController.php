@@ -4,30 +4,21 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers;
 
+use App\Actions\Chat\BuildPrismResponseAction;
 use App\Enums\ChatMessageRole;
+use App\Enums\ChatType;
 use App\Facades\CurrentAccount;
 use App\Http\Requests\ChatStreamRequest;
 use App\Managers\Tenant\ChatManager;
-use App\Mcp\Prism\Tools\Funnel\CreateFunnelTool;
-use App\Mcp\Prism\Tools\Funnel\GetFunnelTool;
-use App\Mcp\Prism\Tools\Funnel\ListFunnelsTool;
-use App\Mcp\Prism\Tools\Funnel\UpdateFunnelTool;
-use App\Mcp\Prism\Tools\Order\ListOrderTool;
-use App\Mcp\Prism\Tools\Product\CreateProductTool;
-use App\Mcp\Prism\Tools\Product\GetProductTool;
-use App\Mcp\Prism\Tools\Product\ListProductsTool;
-use App\Mcp\Prism\Tools\Product\UpdateProductTool;
-use App\Mcp\Prism\Tools\Template\CreateTemplateTool;
-use App\Mcp\Prism\Tools\Template\GetTemplateTool;
-use App\Mcp\Prism\Tools\Template\ListTemplatesTool;
-use App\Mcp\Prism\Tools\Template\UpdateTemplateTool;
 use App\Models\Chat;
 use App\Repositories\Tenant\ChatRepository;
 use Illuminate\Http\StreamedEvent;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Log;
-use Prism\Prism\Enums\ChunkType;
-use Prism\Prism\Prism;
+use Prism\Prism\Exceptions\PrismProviderOverloadedException;
+use Prism\Prism\Streaming\Events\TextDeltaEvent;
+use Prism\Prism\Streaming\Events\ThinkingEvent;
+use Prism\Prism\Streaming\Events\ToolCallEvent;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 /**
@@ -48,68 +39,67 @@ class ChatStreamController extends Controller
         ChatManager $chatManager,
         ChatRepository $chatRepository,
     ): StreamedResponse {
+        set_time_limit(0);
+
         Gate::authorize('viewAny', Chat::class);
 
         $message = $request->validated('message');
         $chatId = $request->validated('chat_id');
-
+        $type = ChatType::from((int) $request->validated('type'));
         $accountId = CurrentAccount::get()->id;
-        $chat = $chatRepository->findByIdAndUserAndAccount($chatId, $request->user()->id, $accountId);
 
-        // Get count of messages sent today by this user
+        $chat = $chatRepository->findByIdAndUserAndAccount($chatId, $request->user()->id, $accountId);
 
         $chatManager->createChatMessage(
             chat: $chat,
             role: ChatMessageRole::USER,
-            parts: [ChunkType::Text->value => $message],
+            parts: ['text' => $message],
         );
 
         $messages = $chatRepository->buildConversationHistory($chat);
 
         /** @phpstan-ignore-next-line */
         return response()->eventStream(
-            function () use ($messages, $chat, $chatManager, $accountId) {
+            function () use ($messages, $chat, $chatManager, $accountId, $type) {
                 $parts = [];
 
                 try {
-                    $tools = [
-                        new GetFunnelTool($accountId),
-                        new ListFunnelsTool($accountId),
-                        new CreateFunnelTool($accountId),
-                        new UpdateFunnelTool($accountId),
-                        new GetProductTool($accountId),
-                        new ListProductsTool($accountId),
-                        new CreateProductTool($accountId),
-                        new UpdateProductTool($accountId),
-                        new GetTemplateTool($accountId),
-                        new ListTemplatesTool($accountId),
-                        new CreateTemplateTool($accountId),
-                        new UpdateTemplateTool($accountId),
-                        new ListOrderTool($accountId),
-                    ];
-                    $response = Prism::text()
-                        ->using('xai', 'grok-code-fast-1')
-                        ->withSystemPrompt('You are a helpful assistant for managing e-commerce platform FunnelGen. Funnels are comprised of products and templates. You also have access to orders history. Use the tools to help the user when applicable.')
-                        ->withMessages($messages)
-                        ->withMaxSteps(5)
-                        ->withTools($tools)
-                        ->asStream();
+                    $response = BuildPrismResponseAction::run(
+                        accountId: $accountId,
+                        messages: $messages,
+                        chatType: $type,
+                    );
 
-                    foreach ($response as $chunk) {
-                        $chunkData = [
-                            'chunkType' => $chunk->chunkType->value,
-                            'content' => $chunk->text,
-                        ];
+                    foreach ($response as $event) {
+                        $chunkData = match (true) {
+                            $event instanceof TextDeltaEvent => [
+                                'chunkType' => 'text',
+                                'content' => $event->delta,
+                            ],
+                            $event instanceof ToolCallEvent => [
+                                'chunkType' => 'tool_call',
+                                'content' => '',
+                                'toolName' => $event->toolCall->name,
+                            ],
+                            $event instanceof ThinkingEvent => [
+                                'chunkType' => 'thinking',
+                                'content' => $event->delta,
+                            ],
+                            default => null,
+                        };
 
-                        if (!empty($chunk->toolName)) {
-                            $chunkData['toolName'] = $chunk->toolName;
+                        if ($chunkData === null) {
+                            continue;
                         }
 
-                        if (! isset($parts[$chunk->chunkType->value])) {
-                            $parts[$chunk->chunkType->value] = '';
+                        $chunkType = $chunkData['chunkType'];
+                        $content = $chunkData['content'];
+
+                        if (! isset($parts[$chunkType])) {
+                            $parts[$chunkType] = '';
                         }
 
-                        $parts[$chunk->chunkType->value] .= $chunk->text;
+                        $parts[$chunkType] .= $content;
 
                         yield new StreamedEvent(
                             event: 'update',
@@ -133,11 +123,19 @@ class ChatStreamController extends Controller
                         'chat_id' => $chat->id,
                     ]);
 
+                    $errorMessage = 'An error occurred while processing your message. Please try again later.';
+
+                    if ($e instanceof PrismProviderOverloadedException) {
+                        $errorMessage = $e->getMessage();
+                    }
+
+                    $errorMessage = $e->getMessage();
+
                     yield new StreamedEvent(
                         event: 'update',
                         data: json_encode([
                             'chunkType' => 'error',
-                            'content' => 'An error occurred while processing your message.',
+                            'content' => $errorMessage,
                         ])
                     );
                 }
